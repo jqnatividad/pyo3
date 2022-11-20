@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - main
+      # for bors r+
+      - staging
+      # for bors try
+      - trying
   pull_request:
   workflow_dispatch:
 
@@ -43,6 +47,7 @@ jobs:
   check-target:
     needs: [fmt]
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     strategy:
       # If one platform fails, allow the rest to keep testing if `CI-no-fail-fast` label is present
       fail-fast: ${{ !contains(github.event.pull_request.labels.*.name, 'CI-no-fail-fast') }}
@@ -68,26 +73,87 @@ jobs:
             PYO3_BUILD_CONFIG=$(pwd)/config.txt cargo check --all-targets --features "abi3 full multiple-pymethods"
           done
 
+  generate-build-matrix:
+    name: generate build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      python-version: ${{ steps.generate-matrix.outputs.python-version }}
+      fail-fast: ${{ steps.generate-matrix.outputs.fail-fast }}
+    steps:
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 16
+      - run: npm install js-yaml
+      - name: generate matrix
+        id: generate-matrix
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const yaml = require('js-yaml')
+            const PYTHON_VERSIONS = yaml.load(process.env.PYTHON_VERSION)
+
+            if (context.eventName == 'workflow_dispatch') {
+              // Run all of them on workflow dispatch
+              core.setOutput('python-version', PYTHON_VERSIONS)
+              core.setOutput('fail-fast', 'false')
+            } else if (context.eventName == 'push') {
+              const commitMessage = process.env.COMMIT_MESSAGE.trim()
+              const matches = commitMessage.match(/(Try|Merge) #([0-9]+):/)
+              if (matches) {
+                const prNumber = matches[2]
+                const { data: { labels: labels } } = await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: prNumber
+                })
+                const labelNames = labels.map(label => label.name)
+                if (labelNames.includes('CI-no-fail-fast')) {
+                  core.setOutput('fail-fast', 'false')
+                }
+              }
+              core.setOutput('python-version', PYTHON_VERSIONS)
+            } else if (context.eventName == 'pull_request') {
+              const { data: { labels: labels } } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number
+              })
+              const labelNames = labels.map(label => label.name)
+              if (labelNames.includes('CI-no-fail-fast')) {
+                core.setOutput('fail-fast', 'false')
+              }
+              // Only run Python 3.11 tests on pull requests
+              core.setOutput('python-version', ['3.11'])
+            }
+    env:
+      COMMIT_MESSAGE: >
+        ${{
+            ((
+              (startsWith(github.event.head_commit.message, 'Try #') || startsWith(github.event.head_commit.message, 'Merge #')) &&
+              github.event.head_commit.author.username == 'bors[bot]'
+            ) && github.event.head_commit.message) || ''
+          }}
+      PYTHON_VERSION: |
+        - '3.7'
+        - '3.8'
+        - '3.9'
+        - '3.10'
+        - '3.11'
+        - 'pypy3.7'
+        - 'pypy3.8'
+        - 'pypy3.9'
+
   build:
-    needs: [fmt] # don't wait for clippy as fails rarely and takes longer
+    needs: [fmt, generate-build-matrix] # don't wait for clippy as fails rarely and takes longer
     name: python${{ matrix.python-version }}-${{ matrix.platform.python-architecture }} ${{ matrix.platform.os }} rust-${{ matrix.rust }}
     runs-on: ${{ matrix.platform.os }}
     strategy:
       # If one platform fails, allow the rest to keep testing if `CI-no-fail-fast` label is present
-      fail-fast: ${{ !contains(github.event.pull_request.labels.*.name, 'CI-no-fail-fast') }}
+      fail-fast: ${{ needs.generate-build-matrix.outputs.fail-fast != 'false' }}
       matrix:
         extra_features: ["multiple-pymethods"]  # Because MSRV doesn't support this
         rust: [stable]
-        python-version: [
-          "3.7",
-          "3.8",
-          "3.9",
-          "3.10",
-          "3.11",
-          "pypy-3.7",
-          "pypy-3.8",
-          "pypy-3.9"
-        ]
+        python-version: ${{ fromJson(needs.generate-build-matrix.outputs.python-version) }}
         platform:
           [
             {
@@ -313,6 +379,7 @@ jobs:
       CARGO_PRIMARY_PACKAGE: 1
 
   valgrind:
+    if: github.event_name != 'pull_request'
     needs: [fmt]
     runs-on: ubuntu-latest
     steps:
@@ -336,6 +403,7 @@ jobs:
       TRYBUILD: overwrite
 
   careful:
+    if: github.event_name != 'pull_request'
     needs: [fmt]
     runs-on: ubuntu-latest
     steps:
@@ -387,6 +455,7 @@ jobs:
 
   emscripten:
     name: emscripten
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -416,3 +485,24 @@ jobs:
         run: nox -s build-emscripten
       - name: Test
         run: nox -s test-emscripten
+  
+  conclusion:
+    needs:
+      - fmt
+      - clippy
+      - check-target
+      - build
+      - valgrind
+      - careful
+      - coverage
+      - emscripten
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Result
+        run: |
+          jq -C <<< "${needs}"
+          # Check if all needs were successful or skipped.
+          "$(jq -r 'all(.result as $result | (["success", "skipped"] | contains([$result])))' <<< "${needs}")"
+        env:
+          needs: ${{ toJson(needs) }}
